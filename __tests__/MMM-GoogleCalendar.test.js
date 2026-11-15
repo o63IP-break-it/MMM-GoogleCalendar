@@ -95,6 +95,9 @@ describe('MMM-GoogleCalendar', () => {
 
   describe('createEventList', () => {
     test('skips events missing start/end instead of aborting the whole render (issue #27)', () => {
+      // Only configured calendars are read (socketNotificationReceived
+      // already drops data for unconfigured IDs).
+      GCal.config.calendars = [{ calendarID: 'cal1' }];
       GCal.calendarData = {
         cal1: [
           { id: 'good', summary: 'Good', start: { dateTime: 'x' }, end: { dateTime: 'y' } },
@@ -252,5 +255,104 @@ describe('MMM-GoogleCalendar', () => {
     });
   });
 
-  // Add more describe blocks for other pure functions if identified
+  describe('mergeEventsById', () => {
+    const A = 'a@example.com';
+    const B = 'b@example.com';
+    const C = 'c@example.com';
+
+    const setup = (calendarData, accessRole = {}, order = [A, B, C]) => {
+      GCal.config.calendars = order.map((calendarID) => ({ calendarID }));
+      GCal.calendarData = calendarData;
+      GCal.calendarAccessRole = accessRole;
+    };
+
+    test('keeps one copy per id and records every calendar in config order', () => {
+      setup({
+        [B]: [{ id: 'shared', summary: 'Daycare Tour' }],
+        [A]: [{ id: 'shared', summary: 'Daycare Tour' }, { id: 'only-a' }]
+      });
+      const merged = GCal.mergeEventsById();
+      expect(merged).toHaveLength(2);
+      const shared = merged.find((e) => e.id === 'shared');
+      expect(shared.calendarIDs).toEqual([A, B]);
+      expect(merged.find((e) => e.id === 'only-a').calendarIDs).toEqual([A]);
+    });
+
+    test("readable attendee copy beats organizer's hidden copy", () => {
+      setup(
+        {
+          [A]: [{ id: 'x', visibility: 'private', organizer: { self: true }, updated: '2026-11-06T15:40:43Z' }],
+          [B]: [{ id: 'x', visibility: 'private', summary: 'Full details', organizer: {}, updated: '2026-11-06T15:40:40Z' }]
+        },
+        { [A]: 'reader', [B]: 'writer' }
+      );
+      const [event] = GCal.mergeEventsById();
+      expect(event.calendarID).toBe(B);
+      expect(event.summary).toBe('Full details');
+      expect(event.calendarIDs).toEqual([A, B]);
+    });
+
+    test("organizer's copy wins even when listed later in config", () => {
+      setup({
+        [A]: [{ id: 'x', organizer: {}, updated: '2026-11-07T00:00:00Z' }],
+        [B]: [{ id: 'x', organizer: { self: true }, updated: '2026-11-06T00:00:00Z' }]
+      });
+      expect(GCal.mergeEventsById()[0].calendarID).toBe(B);
+    });
+
+    test('without an organizer copy, the newest updated wins', () => {
+      setup({
+        [A]: [{ id: 'x', updated: '2026-11-06T00:00:00Z' }],
+        [B]: [{ id: 'x', updated: '2026-11-07T00:00:00Z' }]
+      });
+      expect(GCal.mergeEventsById()[0].calendarID).toBe(B);
+    });
+
+    test('on a full tie, the first calendar in config order wins', () => {
+      setup({
+        [A]: [{ id: 'x', updated: '2026-11-06T00:00:00Z' }],
+        [B]: [{ id: 'x', updated: '2026-11-06T00:00:00Z' }]
+      }, {}, [B, A]);
+      expect(GCal.mergeEventsById()[0].calendarID).toBe(B);
+    });
+
+    test('recurring instances are matched per instance id', () => {
+      setup({
+        [A]: [{ id: 'base_20261118T163000Z', recurringEventId: 'base' }, { id: 'base_20261125T163000Z', recurringEventId: 'base' }],
+        [B]: [{ id: 'base_20261118T163000Z', recurringEventId: 'base' }]
+      });
+      const merged = GCal.mergeEventsById();
+      expect(merged).toHaveLength(2);
+      expect(merged.find((e) => e.id === 'base_20261118T163000Z').calendarIDs).toEqual([A, B]);
+      expect(merged.find((e) => e.id === 'base_20261125T163000Z').calendarIDs).toEqual([A]);
+    });
+
+    test('events without an id are not merged', () => {
+      setup({ [A]: [{ summary: 'no id' }], [B]: [{ summary: 'no id' }] });
+      const merged = GCal.mergeEventsById();
+      expect(merged).toHaveLength(2);
+      expect(merged.map((e) => e.calendarIDs)).toEqual([[A], [B]]);
+    });
+
+    test('does not mutate the stored calendar data', () => {
+      const raw = { id: 'x' };
+      setup({ [A]: [raw] });
+      GCal.mergeEventsById();
+      expect(raw).toEqual({ id: 'x' });
+    });
+  });
+
+  describe('isDetailsHidden', () => {
+    const cal = 'c@example.com';
+    const hidden = (role, visibility) => {
+      GCal.calendarAccessRole = role === undefined ? {} : { [cal]: role };
+      return GCal.isDetailsHidden({ visibility }, cal);
+    };
+
+    test('reader + private is hidden', () => expect(hidden('reader', 'private')).toBe(true));
+    test('reader + confidential is hidden', () => expect(hidden('reader', 'confidential')).toBe(true));
+    test('reader + default is readable', () => expect(hidden('reader', 'default')).toBe(false));
+    test('writer + private is readable', () => expect(hidden('writer', 'private')).toBe(false));
+    test('unknown role is readable', () => expect(hidden(undefined, 'private')).toBe(false));
+  });
 });

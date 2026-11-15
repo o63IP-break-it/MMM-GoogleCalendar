@@ -81,7 +81,12 @@ module.exports = NodeHelper.create({
       // the latest events to whoever asked (e.g. a freshly connected client).
       existing.params = params;
       if (existing.events) {
-        this.broadcastEvents(existing.events, params.identifier, params.calendarID);
+        this.broadcastEvents(
+          existing.events,
+          params.identifier,
+          params.calendarID,
+          existing.accessRole
+        );
       }
       return;
     }
@@ -412,7 +417,11 @@ module.exports = NodeHelper.create({
             `${this.name}: ${events.length} events loaded for ${calendarID}`
           );
           fetcher.events = events;
-          this.broadcastEvents(events, identifier, calendarID);
+          // The caller's access level on this calendar (owner, writer, reader,
+          // ...). The frontend uses it to tell which copy of a shared event may
+          // have its details hidden.
+          fetcher.accessRole = res.data.accessRole;
+          this.broadcastEvents(events, identifier, calendarID, fetcher.accessRole);
         }
 
         this.scheduleNextCalendarFetch(key);
@@ -435,11 +444,11 @@ module.exports = NodeHelper.create({
     }, fetcher.params.fetchInterval);
   },
 
-  broadcastEvents: function (events, identifier, calendarID) {
-    // parameters, let/const not applicable
+  broadcastEvents: function (events, identifier, calendarID, accessRole) {
     this.sendSocketNotification("CALENDAR_EVENTS", {
       id: identifier,
       calendarID,
+      accessRole,
       events: events
     });
   }

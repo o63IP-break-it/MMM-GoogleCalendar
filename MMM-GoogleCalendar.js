@@ -107,6 +107,8 @@ Module.register("MMM-GoogleCalendar", {
 
     // clear data holder before start
     this.calendarData = {};
+    // events.list accessRole per calendar ID (owner, writer, reader, ...)
+    this.calendarAccessRole = {};
 
     // indicate no data available yet
     this.loaded = false;
@@ -162,6 +164,7 @@ Module.register("MMM-GoogleCalendar", {
     if (notification === "CALENDAR_EVENTS") {
       if (this.hasCalendarID(payload.calendarID)) {
         this.calendarData[payload.calendarID] = payload.events;
+        this.calendarAccessRole[payload.calendarID] = payload.accessRole;
         this.error = null;
         this.loaded = true;
 
@@ -734,91 +737,87 @@ Module.register("MMM-GoogleCalendar", {
 
     const formatStr = undefined; // This seems unused, consider removing if truly not needed.
 
-    for (const calendarID in this.calendarData) {
-      const calendar = this.calendarData[calendarID];
-      for (const e in calendar) { // Consider using for...of if calendar is an array or iterating its keys differently
-        const event = JSON.parse(JSON.stringify(calendar[e])); // clone object
+    // One copy per Google event id, already cloned, with calendarID and
+    // calendarIDs set. See mergeEventsById.
+    for (const event of this.mergeEventsById()) {
+      // Skip events that have no start/end (e.g. cancelled recurring
+      // instances or some private/busy events). These can't be placed on
+      // the timeline and previously caused the whole render to abort,
+      // making unrelated events/calendars silently disappear (issue #27).
+      if (!event.start || !event.end) {
+        Log.debug(
+          `${this.name}: Skipping event without start/end`,
+          event.id
+        );
+        continue;
+      }
 
-        // Skip events that have no start/end (e.g. cancelled recurring
-        // instances or some private/busy events). These can't be placed on
-        // the timeline and previously caused the whole render to abort,
-        // making unrelated events/calendars silently disappear (issue #27).
-        if (!event.start || !event.end) {
-          Log.debug(
-            `${this.name}: Skipping event without start/end`,
-            event.id
-          );
-          continue;
-        }
+      // added props
+      event.endDate = this.extractCalendarDate(event.end);
+      event.startDate = this.extractCalendarDate(event.start);
 
-        // added props
-        event.calendarID = calendarID;
-        event.endDate = this.extractCalendarDate(event.end);
-        event.startDate = this.extractCalendarDate(event.start);
-
-        // Call filterEvent to determine if the event should be excluded based on various settings.
-        // The 'events' array (eventsList in filterEvent) is the accumulating list of events
-        // that have passed all filters so far, used for duplicate checking.
+      // Call filterEvent to determine if the event should be excluded based on various settings.
+      // The 'events' array (eventsList in filterEvent) is the accumulating list of events
+      // that have passed all filters so far, used for duplicate checking.
 		if (this.filterEvent(event, events)) {
 			continue; // Skip this event if filterEvent returns true
 		}
 
-        // The redundant duplicate check that was here has been removed.
-        // filterEvent now solely handles the hideDuplicates logic.
+      // The redundant duplicate check that was here has been removed.
+      // filterEvent now solely handles the hideDuplicates logic.
 
-        event.url = event.htmlLink;
-        event.today =
-          event.startDate >= today &&
-          event.startDate < today + 24 * 60 * 60 * 1000;
-        event.title = event.summary === undefined ? this.translate("PRIVATE_EVENT") : event.summary;
+      event.url = event.htmlLink;
+      event.today =
+        event.startDate >= today &&
+        event.startDate < today + 24 * 60 * 60 * 1000;
+      event.title = event.summary === undefined ? this.translate("PRIVATE_EVENT") : event.summary;
 
-        /* if sliceMultiDayEvents is set to true, multiday events (events exceeding at least one midnight) are sliced into days,
-         * otherwise, esp. in dateheaders mode it is not clear how long these events are.
-         */
-        const maxCount =
-          Math.ceil(
-            (event.endDate -
-              1 -
-              moment(event.startDate, formatStr) // formatStr is undefined here
-                .endOf("day")
-                .format(formatStr)) / // formatStr is undefined here
-              (1000 * 60 * 60 * 24)
-          ) + 1;
-        if (this.config.sliceMultiDayEvents && maxCount > 1) {
-          const splitEvents = [];
-          let midnight = moment(event.startDate, formatStr) // formatStr is undefined here
-            .clone()
-            .startOf("day")
+      /* if sliceMultiDayEvents is set to true, multiday events (events exceeding at least one midnight) are sliced into days,
+       * otherwise, esp. in dateheaders mode it is not clear how long these events are.
+       */
+      const maxCount =
+        Math.ceil(
+          (event.endDate -
+            1 -
+            moment(event.startDate, formatStr) // formatStr is undefined here
+              .endOf("day")
+              .format(formatStr)) / // formatStr is undefined here
+            (1000 * 60 * 60 * 24)
+        ) + 1;
+      if (this.config.sliceMultiDayEvents && maxCount > 1) {
+        const splitEvents = [];
+        let midnight = moment(event.startDate, formatStr) // formatStr is undefined here
+          .clone()
+          .startOf("day")
+          .add(1, "day")
+          .format(formatStr); // formatStr is undefined here
+        let count = 1;
+        while (event.endDate > midnight) {
+          const thisEvent = JSON.parse(JSON.stringify(event)); // clone object
+          thisEvent.today =
+            thisEvent.startDate >= today &&
+            thisEvent.startDate < today + 24 * 60 * 60 * 1000;
+          thisEvent.endDate = midnight;
+          thisEvent.title += ` (${count}/${maxCount})`; // Template literal
+          splitEvents.push(thisEvent);
+
+          event.startDate = midnight;
+          count += 1;
+          midnight = moment(midnight, formatStr) // formatStr is undefined here
             .add(1, "day")
-            .format(formatStr); // formatStr is undefined here
-          let count = 1;
-          while (event.endDate > midnight) {
-            const thisEvent = JSON.parse(JSON.stringify(event)); // clone object
-            thisEvent.today =
-              thisEvent.startDate >= today &&
-              thisEvent.startDate < today + 24 * 60 * 60 * 1000;
-            thisEvent.endDate = midnight;
-            thisEvent.title += ` (${count}/${maxCount})`; // Template literal
-            splitEvents.push(thisEvent);
-
-            event.startDate = midnight;
-            count += 1;
-            midnight = moment(midnight, formatStr) // formatStr is undefined here
-              .add(1, "day")
-              .format(formatStr); // formatStr is undefined here // next day
-          }
-          // Last day
-          event.title += ` (${count}/${maxCount})`; // Template literal
-          splitEvents.push(event);
-
-          for (const splitEvent of splitEvents) { // Use for...of for arrays
-            if (splitEvent.end > now && splitEvent.end <= future) {
-              events.push(splitEvent);
-            }
-          }
-        } else {
-          events.push(event);
+            .format(formatStr); // formatStr is undefined here // next day
         }
+        // Last day
+        event.title += ` (${count}/${maxCount})`; // Template literal
+        splitEvents.push(event);
+
+        for (const splitEvent of splitEvents) { // Use for...of for arrays
+          if (splitEvent.end > now && splitEvent.end <= future) {
+            events.push(splitEvent);
+          }
+        }
+      } else {
+        events.push(event);
       }
     }
 
@@ -868,6 +867,110 @@ Module.register("MMM-GoogleCalendar", {
       }
     }
     return false;
+  },
+
+  /**
+   * Access roles under which, per the Calendar API docs, private events
+   * "will appear ... but event details will be hidden" (events.list
+   * `accessRole`). freeBusyReader only gets free/busy information.
+   */
+  detailsHiddenAccessRoles: ["reader", "writerWithoutPrivateAccess", "freeBusyReader"],
+
+  /**
+   * Whether this copy of an event may have its details hidden from us.
+   *
+   * The API docs don't say which fields are dropped, so this doesn't guess
+   * from missing fields. It only uses the two documented signals: a private
+   * or confidential event, on a calendar where our access role hides private
+   * details. An unknown role counts as readable.
+   *
+   * @param {object} event The raw Google event.
+   * @param {string} calendarID The calendar this copy came from.
+   * @returns {boolean} True if the details may be hidden.
+   */
+  isDetailsHidden: function (event, calendarID) {
+    const role = this.calendarAccessRole?.[calendarID];
+    const visibility = event?.visibility?.toLowerCase();
+    return (
+      this.detailsHiddenAccessRoles.includes(role) &&
+      (visibility === "private" || visibility === "confidential")
+    );
+  },
+
+  /**
+   * Whether copy `a` should be shown instead of copy `b` of the same event.
+   * Order: readable over hidden, then the organizer's copy, then the most
+   * recently updated. Returns false on a full tie, so the earlier calendar
+   * in config order keeps it.
+   *
+   * @param {object} a Candidate copy (with calendarID set).
+   * @param {object} b Current winner (with calendarID set).
+   * @returns {boolean} True if `a` should replace `b`.
+   */
+  isPreferredCopy: function (a, b) {
+    const aHidden = this.isDetailsHidden(a, a.calendarID);
+    const bHidden = this.isDetailsHidden(b, b.calendarID);
+    if (aHidden !== bHidden) {
+      return !aHidden;
+    }
+
+    const aOrganizer = a.organizer?.self === true;
+    const bOrganizer = b.organizer?.self === true;
+    if (aOrganizer !== bOrganizer) {
+      return aOrganizer;
+    }
+
+    const aUpdated = Date.parse(a.updated) || 0;
+    const bUpdated = Date.parse(b.updated) || 0;
+    return aUpdated > bUpdated;
+  },
+
+  /**
+   * Combines the events of all calendars, keeping one copy per Google event
+   * id. Each returned event is a clone with `calendarID` (the calendar the
+   * shown copy came from, which drives symbol/colour/classes) and
+   * `calendarIDs` (every configured calendar it was found on, in config
+   * order). Events without an id can't be matched and are kept per calendar.
+   *
+   * @returns {object[]} The merged events, unsorted.
+   */
+  mergeEventsById: function () {
+    const byId = new Map();
+    const result = [];
+
+    for (const { calendarID } of this.config.calendars) {
+      const calendarEvents = this.calendarData[calendarID];
+      if (!Array.isArray(calendarEvents)) {
+        continue;
+      }
+
+      for (const raw of calendarEvents) {
+        const event = JSON.parse(JSON.stringify(raw)); // clone object
+        event.calendarID = calendarID;
+
+        const entry = event.id ? byId.get(event.id) : undefined;
+        if (!entry) {
+          const newEntry = { event, calendarIDs: [calendarID] };
+          if (event.id) {
+            byId.set(event.id, newEntry);
+          }
+          result.push(newEntry);
+          continue;
+        }
+
+        if (!entry.calendarIDs.includes(calendarID)) {
+          entry.calendarIDs.push(calendarID);
+        }
+        if (this.isPreferredCopy(event, entry.event)) {
+          entry.event = event;
+        }
+      }
+    }
+
+    return result.map(({ event, calendarIDs }) => {
+      event.calendarIDs = calendarIDs;
+      return event;
+    });
   },
 
   /**
@@ -1266,37 +1369,35 @@ Module.register("MMM-GoogleCalendar", {
   broadcastEvents: function () {
     const now = new Date();
     const eventList = [];
-    for (const calendarID in this.calendarData) { // `calendarID` is a key, `const` is appropriate
-      for (const ev of this.calendarData[calendarID]) { // Use for...of for arrays
-        const event = { ...ev }; // Use spread syntax for shallow clone instead of Object.assign
-        event.calendarID = calendarID;
-        event.symbol = this.symbolsForEvent(event);
-        event.calendarName = this.calendarNameForCalendar(calendarID);
-        event.color = this.colorForEvent(event);
-        delete event.calendarID;
+    // One copy per Google event id; keeps `calendarIDs` in the payload.
+    for (const event of this.mergeEventsById()) {
+      const calendarID = event.calendarID;
+      event.symbol = this.symbolsForEvent(event);
+      event.calendarName = this.calendarNameForCalendar(calendarID);
+      event.color = this.colorForEvent(event);
+      delete event.calendarID;
 
-        // Make a broadcasting event to be compatible with the default calendar module.
-        event.title = event.summary === undefined ? this.translate("PRIVATE_EVENT") : event.summary;
+      // Make a broadcasting event to be compatible with the default calendar module.
+      event.title = event.summary === undefined ? this.translate("PRIVATE_EVENT") : event.summary;
 
-        event.fullDayEvent = !!(event.start?.date && event.end?.date);
+      event.fullDayEvent = !!(event.start?.date && event.end?.date);
 
-        if (event.fullDayEvent) {
-          // For all-day events, we ensure startDate is local midnight of the start day
-          event.startDate = event.start?.date ? moment(event.start.date + "T00:00:00").valueOf() : null;
-          // Ensure endDate is local midnight of the day *after* the end day (exclusive end)
-          event.endDate = event.end?.date ? moment(event.end.date + "T00:00:00").valueOf() : null;
-        } else {
-          // For timed events, moment parses ISO8601 strings correctly with timezone
-          event.startDate = event.start?.dateTime ? moment(event.start.dateTime).valueOf() : null;
-          event.endDate = event.end?.dateTime ? moment(event.end.dateTime).valueOf() : null;
-        }
-
-        if (this.config.broadcastEvents && !this.config.broadcastPastEvents && event.endDate < now) {
-          continue;
-        }
-
-        eventList.push(event);
+      if (event.fullDayEvent) {
+        // For all-day events, we ensure startDate is local midnight of the start day
+        event.startDate = event.start?.date ? moment(event.start.date + "T00:00:00").valueOf() : null;
+        // Ensure endDate is local midnight of the day *after* the end day (exclusive end)
+        event.endDate = event.end?.date ? moment(event.end.date + "T00:00:00").valueOf() : null;
+      } else {
+        // For timed events, moment parses ISO8601 strings correctly with timezone
+        event.startDate = event.start?.dateTime ? moment(event.start.dateTime).valueOf() : null;
+        event.endDate = event.end?.dateTime ? moment(event.end.dateTime).valueOf() : null;
       }
+
+      if (this.config.broadcastEvents && !this.config.broadcastPastEvents && event.endDate < now) {
+        continue;
+      }
+
+      eventList.push(event);
     }
 
     eventList.sort((a, b) => a.startDate - b.startDate); // Arrow function

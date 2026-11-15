@@ -12,7 +12,7 @@ function makeHelper() {
   helper.start();
   helper.calendarService = {
     events: {
-      list: jest.fn((params, cb) => cb(null, { data: { items: [{ id: params.calendarId }] } }))
+      list: jest.fn((params, cb) => cb(null, { data: { accessRole: "reader", items: [{ id: params.calendarId }] } }))
     }
   };
   return helper;
@@ -56,6 +56,10 @@ describe("node_helper fetch loops", () => {
       ([n]) => n === "CALENDAR_EVENTS"
     );
     expect(eventNotifications).toHaveLength(2);
+    // Both the fresh and the cached send carry the calendar's accessRole.
+    for (const [, payload] of eventNotifications) {
+      expect(payload.accessRole).toBe("reader");
+    }
     expect(helper.calendarService.events.list).toHaveBeenCalledTimes(1);
     helper.stop();
   });
